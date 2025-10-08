@@ -1,0 +1,14 @@
+fastapi
+uvicorn
+folium
+networkx
+sqlalchemy
+python-multipart
+pydantic
+pytest
+ortools
+pandas
+scikit-learn
+geopandas
+shapely
+fiona
