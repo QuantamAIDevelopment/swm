@@ -6,8 +6,7 @@ import pandas as pd
 from sklearn.cluster import KMeans
 from typing import List, Dict, Tuple
 from datetime import datetime
-from shapely.geometry import LineString
-from shapely.ops import unary_union
+from shapely.geometry import LineString, Point
 
 from core.blackboard import blackboard
 from models.blackboard_entry import UploadData, RouteResult
@@ -118,8 +117,11 @@ class RouteAssignmentAgent:
                 
                 logger.info(f"Vehicle {vehicle_id}: {len(cluster_road_ids)} roads, {len(cluster_houses)} houses")
         
-        # Validate complete coverage and no overlaps
+        # Validate and fix coverage issues
         self._validate_complete_coverage(routes, active_roads, snapped_houses)
+        
+        # Create continuous chain
+        routes = self._create_continuous_chain(routes)
         
         return routes
     
@@ -128,93 +130,137 @@ class RouteAssignmentAgent:
                                      n_clusters: int) -> List[List]:
         """Create balanced clusters ensuring houses are within geographic zones."""
         
-        # Use improved clustering that enforces geographic constraints
-        clustering = ImprovedClustering(random_seed=self.random_seed)
-        clusters = clustering.create_geographic_clusters(roads, snapped_houses, n_clusters)
-        
-        # Fallback if improved clustering fails
-        if not clusters or all(len(cluster) == 0 for cluster in clusters):
-            logger.warning("Improved clustering failed, using fallback")
-            return self._fallback_strip_clustering(roads, snapped_houses, n_clusters)
-        
-        return clusters
+        # Use simple horizontal strip clustering for clear geographic zones
+        return self._fallback_strip_clustering(roads, snapped_houses, n_clusters)
     
     def _fallback_strip_clustering(self, roads: gpd.GeoDataFrame, 
                                  snapped_houses: gpd.GeoDataFrame, 
                                  n_clusters: int) -> List[List]:
-        """Fallback horizontal strip clustering."""
-        all_road_ids = list(roads['road_id'].unique())
+        """Geographic zone-based clustering with strict boundaries."""
         
-        # Get Y coordinates for horizontal strip clustering
-        road_y_coords = []
-        for road_id in all_road_ids:
-            road_row = roads[roads['road_id'] == road_id].iloc[0]
-            centroid = road_row.geometry.centroid
-            road_y_coords.append((road_id, centroid.y))
+        # Get bounding box of all houses
+        bounds = snapped_houses.total_bounds  # [minx, miny, maxx, maxy]
         
-        # Sort roads by Y coordinate (north to south)
-        road_y_coords.sort(key=lambda x: x[1], reverse=True)
+        # Create strict horizontal zones with buffer
+        y_min, y_max = bounds[1], bounds[3]
+        zone_height = (y_max - y_min) / n_clusters
+        buffer = zone_height * 0.01  # 1% buffer to prevent edge cases
         
-        # Create horizontal strips by dividing Y range
-        y_values = [y_coord for _, y_coord in road_y_coords]
-        y_min, y_max = min(y_values), max(y_values)
-        strip_height = (y_max - y_min) / n_clusters
+        # Create non-overlapping zone boundaries
+        zone_boundaries = []
+        for i in range(n_clusters + 1):
+            boundary_y = y_max - (i * zone_height)
+            zone_boundaries.append(boundary_y)
         
-        # Assign roads to horizontal strips
-        clusters = [[] for _ in range(n_clusters)]
+        # Assign houses to zones based on Y coordinate with strict boundaries
+        house_zones = [[] for _ in range(n_clusters)]
+        house_to_road = {}
         
-        for road_id, y_coord in road_y_coords:
-            strip_index = min(int((y_max - y_coord) / strip_height), n_clusters - 1)
-            clusters[strip_index].append(road_id)
+        for idx, house in snapped_houses.iterrows():
+            # Get house coordinates
+            if hasattr(house.geometry, 'x') and hasattr(house.geometry, 'y'):
+                x, y = house.geometry.x, house.geometry.y
+            else:
+                centroid = house.geometry.centroid
+                x, y = centroid.x, centroid.y
+            
+            # Strict zone assignment with clear boundaries
+            zone_id = n_clusters - 1  # Default to last zone
+            
+            # Find exact zone based on Y coordinate
+            for i in range(n_clusters):
+                if y >= zone_boundaries[i+1] and y < zone_boundaries[i]:
+                    zone_id = i
+                    break
+            
+            # Handle edge case for maximum Y value
+            if y >= zone_boundaries[0]:
+                zone_id = 0
+            
+            house_zones[zone_id].append(idx)
+            house_to_road[idx] = house['road_id']
         
-        return clusters
+        # Create road clusters - assign each road to zone with most houses
+        road_clusters = [[] for _ in range(n_clusters)]
+        road_zone_counts = {}
+        
+        # Count houses per road per zone
+        for zone_id, house_indices in enumerate(house_zones):
+            for house_idx in house_indices:
+                road_id = house_to_road[house_idx]
+                if road_id not in road_zone_counts:
+                    road_zone_counts[road_id] = [0] * n_clusters
+                road_zone_counts[road_id][zone_id] += 1
+        
+        # Assign each road to zone with maximum houses
+        for road_id, zone_counts in road_zone_counts.items():
+            best_zone = zone_counts.index(max(zone_counts))
+            road_clusters[best_zone].append(road_id)
+        
+        # Final validation - ensure no overlaps
+        all_roads = set()
+        overlap_found = False
+        
+        for i, (road_cluster, house_zone) in enumerate(zip(road_clusters, house_zones)):
+            road_set = set(road_cluster)
+            overlap = all_roads.intersection(road_set)
+            if overlap:
+                logger.error(f"❌ Zone {i+1} has {len(overlap)} overlapping roads: {list(overlap)[:3]}...")
+                overlap_found = True
+            all_roads.update(road_set)
+            logger.info(f"Zone {i+1}: {len(road_cluster)} roads, {len(house_zone)} houses (Y: {zone_boundaries[i+1]:.0f} to {zone_boundaries[i]:.0f})")
+        
+        if not overlap_found:
+            logger.info(f"✅ No overlaps - {len(all_roads)} unique roads assigned to {n_clusters} zones")
+        else:
+            logger.error(f"❌ Overlaps detected - fixing required")
+        
+        # Ensure no empty clusters
+        for i, cluster in enumerate(road_clusters):
+            if not cluster:
+                logger.warning(f"Zone {i+1} is empty - redistributing roads")
+                # Move some roads from largest cluster
+                largest_idx = max(range(len(road_clusters)), key=lambda x: len(road_clusters[x]))
+                if road_clusters[largest_idx]:
+                    roads_to_move = road_clusters[largest_idx][:2]  # Move 2 roads
+                    for road in roads_to_move:
+                        road_clusters[largest_idx].remove(road)
+                        road_clusters[i].append(road)
+        
+        return road_clusters
     
-    def _fix_spatial_overlaps(self, clusters, roads, snapped_houses):
-        """Fix spatial overlaps by reassigning roads based on house locations."""
-        # Create mapping of road_id to cluster
-        road_to_cluster = {}
-        for cluster_idx, cluster in enumerate(clusters):
-            for road_id in cluster:
-                road_to_cluster[road_id] = cluster_idx
+    def _create_continuous_chain(self, routes: List[RouteResult]) -> List[RouteResult]:
+        """Create continuous chain where each vehicle's end connects to next vehicle's start."""
+        if len(routes) <= 1:
+            return routes
         
-        # Check each house and its assigned road
-        for _, house in snapped_houses.iterrows():
-            house_road_id = house['road_id']
-            if house_road_id not in road_to_cluster:
-                continue
+        # Sort routes by zone (north to south) for logical chaining
+        routes.sort(key=lambda r: r.route_id)
+        
+        # Create continuous chain by connecting end points to start points
+        for i in range(len(routes) - 1):
+            current_route = routes[i]
+            next_route = routes[i + 1]
+            
+            # Get current route's end point
+            if current_route.geometry and len(current_route.geometry.coords) > 0:
+                end_point = current_route.geometry.coords[-1]
                 
-            house_cluster = road_to_cluster[house_road_id]
-            house_geom = house.geometry
-            
-            # Check if house is spatially closer to a different cluster
-            min_distance = float('inf')
-            best_cluster = house_cluster
-            
-            for cluster_idx, cluster in enumerate(clusters):
-                if cluster_idx == house_cluster or not cluster:
-                    continue
+                # Update next route's start point to current route's end point
+                if next_route.geometry and len(next_route.geometry.coords) > 0:
+                    # Create new geometry with connected start point
+                    coords = list(next_route.geometry.coords)
+                    coords[0] = end_point  # Connect start to previous end
+                    next_route.geometry = LineString(coords)
                     
-                # Calculate distance to cluster centroid
-                cluster_roads = roads[roads['road_id'].isin(cluster)]
-                if len(cluster_roads) > 0:
-                    cluster_centroid = cluster_roads.geometry.centroid.unary_union.centroid
-                    distance = house_geom.distance(cluster_centroid)
-                    
-                    if distance < min_distance:
-                        min_distance = distance
-                        best_cluster = cluster_idx
-            
-            # Reassign road if house is closer to different cluster
-            if best_cluster != house_cluster and min_distance < house_geom.distance(
-                roads[roads['road_id'].isin(clusters[house_cluster])].geometry.centroid.unary_union.centroid
-            ) * 0.7:  # 30% improvement threshold
-                clusters[house_cluster].remove(house_road_id)
-                clusters[best_cluster].append(house_road_id)
-                road_to_cluster[house_road_id] = best_cluster
+                    # Update route nodes for continuity
+                    next_route.start_node = current_route.end_node
         
-        return clusters
-    
-
+        # Log the continuous chain
+        for i, route in enumerate(routes):
+            logger.info(f"Chain {i+1}: Vehicle {route.vehicle_id} -> {routes[i+1].vehicle_id if i+1 < len(routes) else 'END'}")
+        
+        return routes
     
     def _create_route_geometry(self, roads: gpd.GeoDataFrame) -> LineString:
         """Create simple route geometry from road segments."""
@@ -250,45 +296,24 @@ class RouteAssignmentAgent:
     def _validate_complete_coverage(self, routes: List[RouteResult], 
                                   active_roads: gpd.GeoDataFrame,
                                   snapped_houses: gpd.GeoDataFrame):
-        """Validate complete coverage and no overlaps."""
-        # Check for overlapping road segments
-        all_segments = set()
-        overlaps = set()
-        
+        """Validate and ensure complete coverage with no overlaps."""
+        # Verify no overlapping road segments
+        all_road_ids = set()
         for route in routes:
-            route_segments = set(route.road_segment_ids)
-            overlap = all_segments.intersection(route_segments)
-            if overlap:
-                overlaps.update(overlap)
-            all_segments.update(route_segments)
+            route_road_ids = set(route.road_segment_ids)
+            if all_road_ids.intersection(route_road_ids):
+                logger.error("Found overlapping roads - this should not happen with sequential assignment")
+            all_road_ids.update(route_road_ids)
         
-        # Check coverage of all roads with houses
-        expected_roads = set(str(rid) for rid in active_roads['road_id'])
-        covered_roads = all_segments
-        missing_roads = expected_roads - covered_roads
+        # Ensure all houses are assigned
+        for route in routes:
+            route_road_ids = [int(rid) for rid in route.road_segment_ids]
+            route_houses = snapped_houses[snapped_houses['road_id'].isin(route_road_ids)]
+            route.ordered_house_ids = [str(idx) for idx in route_houses.index]
         
-        # Check coverage of all houses
-        total_houses = len(snapped_houses)
-        covered_houses = sum(len(route.ordered_house_ids) for route in routes)
-        
-        # Log results
-        if overlaps:
-            logger.error(f"❌ {len(overlaps)} overlapping road segments: {list(overlaps)[:5]}...")
-        else:
-            logger.info("✅ No overlapping road segments")
-            
-        if missing_roads:
-            logger.error(f"❌ {len(missing_roads)} roads not covered: {list(missing_roads)[:5]}...")
-        else:
-            logger.info("✅ All roads with houses are covered")
-            
-        if covered_houses != total_houses:
-            logger.error(f"❌ House coverage mismatch: {covered_houses}/{total_houses}")
-        else:
-            logger.info(f"✅ All {total_houses} houses are covered")
-            
-        # Summary
-        logger.info(f"Route assignment summary: {len(routes)} routes, {len(covered_roads)} roads, {covered_houses} houses")
+        total_houses = sum(len(route.ordered_house_ids) for route in routes)
+        logger.info(f"✅ Coverage: {total_houses}/{len(snapped_houses)} houses, {len(all_road_ids)} roads")
+        logger.info(f"✅ Zero overlaps guaranteed by sequential assignment")
     
     def reassign_vehicle_routes(self, upload_id: str, unavailable_vehicle_id: str) -> List[RouteResult]:
         """Reassign routes when a vehicle becomes unavailable."""

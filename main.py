@@ -1,54 +1,159 @@
-"""Main entry point for the garbage collection route assignment system."""
-import logging
+"""Main orchestrator for geospatial AI garbage collection route optimization."""
 import os
-import socket
-import uvicorn
-from api.routes import app
-from configurations.config import Config
+import sys
+import argparse
+from pathlib import Path
+from loguru import logger
 
-# Configure logging
-logging.basicConfig(
-    level=getattr(logging, Config.LOG_LEVEL),
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
+# Import our modular components
+from data_processing.load_road_network import RoadNetworkLoader
+from data_processing.snap_buildings import BuildingSnapper
+from clustering.assign_buildings import BuildingClusterer
+from routing.compute_routes import RouteComputer
+from routing.get_osrm_directions import OSRMDirectionsProvider
+from visualization.export_to_geojson import RouteExporter
+from visualization.folium_map import FoliumMapGenerator
 
-logger = logging.getLogger(__name__)
-
-def is_port_available(host, port):
-    """Check if a port is available."""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        try:
-            s.bind((host, port))
-            return True
-        except OSError:
-            return False
+class GeospatialRouteOptimizer:
+    """Complete geospatial AI routing system for garbage collection."""
+    
+    def __init__(self, osrm_url: str = "http://router.project-osrm.org"):
+        self.road_loader = RoadNetworkLoader()
+        self.building_snapper = None
+        self.clusterer = BuildingClusterer()
+        self.route_computer = None
+        self.directions_provider = OSRMDirectionsProvider(osrm_url)
+        self.exporter = RouteExporter()
+        self.map_generator = FoliumMapGenerator()
+        
+        logger.info("🎯 Geospatial AI Route Optimizer initialized")
+        logger.info("🚗 OSRM: Real-world driving directions")
+        logger.info("🗺️ NetworkX: Road network graph construction")
+        logger.info("🔧 OR-Tools: VRP optimization")
+        logger.info("📊 K-means/DBSCAN: Geographic clustering")
+    
+    def process_ward_data(self, roads_geojson: str, buildings_geojson: str, 
+                         vehicles_csv: str, output_dir: str = "output") -> dict:
+        """Complete pipeline: load → cluster → route → directions → export."""
+        
+        logger.info(f"🚀 Starting route optimization pipeline")
+        
+        # Create output directory
+        Path(output_dir).mkdir(exist_ok=True)
+        
+        # 1️⃣ Load and build road network graph
+        logger.info("1️⃣ Loading road network...")
+        road_gdf = self.road_loader.load_geojson(roads_geojson)
+        road_graph = self.road_loader.build_networkx_graph()
+        
+        # 2️⃣ Load and snap buildings to road network
+        logger.info("2️⃣ Loading and snapping buildings...")
+        self.building_snapper = BuildingSnapper(road_graph)
+        buildings_gdf = self.building_snapper.load_buildings(buildings_geojson)
+        snapped_buildings = self.building_snapper.snap_to_road_network(buildings_gdf)
+        
+        # 3️⃣ Load vehicles and determine clustering
+        logger.info("3️⃣ Loading vehicles and clustering buildings...")
+        vehicles_df = self.clusterer.load_vehicles(vehicles_csv)
+        num_vehicles = len(vehicles_df)
+        clustered_buildings = self.clusterer.cluster_buildings(snapped_buildings, num_vehicles)
+        
+        # 4️⃣ Compute optimal routes
+        logger.info("4️⃣ Computing optimal routes...")
+        self.route_computer = RouteComputer(road_graph)
+        routes = self.route_computer.compute_cluster_routes(clustered_buildings)
+        
+        # 5️⃣ Get OSRM directions with color coding
+        logger.info("5️⃣ Getting turn-by-turn directions...")
+        directions = {}
+        for cluster_id, route_data in routes.items():
+            if route_data['nodes']:
+                # Convert nodes to (lon, lat) for OSRM
+                coordinates = [(node[0], node[1]) for node in route_data['nodes']]
+                directions[cluster_id] = self.directions_provider.get_route_directions(coordinates)
+        
+        # 6️⃣ Export results
+        logger.info("6️⃣ Exporting results...")
+        
+        # Prepare and export GeoJSON
+        routes_gdf = self.exporter.prepare_routes_geojson(routes, vehicles_df, directions)
+        routes_path = os.path.join(output_dir, "routes.geojson")
+        self.exporter.export_routes_geojson(routes_path)
+        
+        # Prepare and export summary CSV
+        summary_df = self.exporter.prepare_summary_csv(routes, vehicles_df, directions)
+        summary_path = os.path.join(output_dir, "summary.csv")
+        self.exporter.export_summary_csv(summary_path)
+        
+        # Create interactive map
+        route_map = self.map_generator.create_route_map(routes_gdf, clustered_buildings)
+        map_path = os.path.join(output_dir, "route_map.html")
+        self.map_generator.save_map(route_map, map_path)
+        
+        # Create cluster analysis map
+        cluster_map = self.map_generator.create_cluster_analysis_map(clustered_buildings)
+        cluster_map_path = os.path.join(output_dir, "cluster_analysis.html")
+        self.map_generator.save_map(cluster_map, cluster_map_path)
+        
+        results = {
+            'routes_geojson': routes_path,
+            'summary_csv': summary_path,
+            'route_map': map_path,
+            'cluster_map': cluster_map_path,
+            'num_vehicles': num_vehicles,
+            'num_buildings': len(clustered_buildings),
+            'total_distance': sum(route['total_distance'] for route in routes.values()),
+            'total_duration': sum(directions.get(cid, {}).get('total_duration', 0) for cid in routes.keys())
+        }
+        
+        logger.success(f"✅ Pipeline completed! Results saved to {output_dir}")
+        logger.info(f"📊 {num_vehicles} vehicles, {len(clustered_buildings)} buildings")
+        logger.info(f"📏 Total distance: {results['total_distance']:.0f}m")
+        logger.info(f"⏱️ Total duration: {results['total_duration']/60:.1f} min")
+        
+        return results
 
 def main():
-    """Start the FastAPI application."""
-    logger.info("Starting Intelligent Garbage Collection Route Assignment System")
+    """Command line interface for the route optimizer."""
+    parser = argparse.ArgumentParser(description="Geospatial AI Garbage Collection Route Optimizer")
+    parser.add_argument("--roads", help="Path to roads GeoJSON file")
+    parser.add_argument("--buildings", help="Path to buildings GeoJSON file")
+    parser.add_argument("--vehicles", help="Path to vehicles CSV file")
+    parser.add_argument("--output", default="output", help="Output directory")
+    parser.add_argument("--osrm-url", default="http://router.project-osrm.org", help="OSRM server URL")
+    parser.add_argument("--api", action="store_true", help="Start FastAPI server instead")
     
-    # Try different ports if the configured one is busy
-    ports_to_try = [Config.API_PORT, 7001, 7002, 7003, 7004, 7005, 6000, 6001, 6002]
+    args = parser.parse_args()
     
-    available_port = None
-    for port in ports_to_try:
-        if is_port_available(Config.API_HOST, port):
-            available_port = port
-            break
-        else:
-            logger.warning(f"Port {port} is busy")
-    
-    if available_port is None:
-        logger.error("Could not find an available port")
-        raise Exception("No available ports found")
-    
-    logger.info(f"Starting server on {Config.API_HOST}:{available_port}")
-    uvicorn.run(
-        app,
-        host=Config.API_HOST,
-        port=available_port,
-        log_level=Config.LOG_LEVEL.lower()
-    )
+    if args.api:
+        # Start FastAPI server
+        import uvicorn
+        from api.geospatial_routes import app
+        logger.info("🚀 Starting FastAPI server...")
+        uvicorn.run(app, host="0.0.0.0", port=3001)
+    else:
+        # Validate required arguments for CLI mode
+        if not all([args.roads, args.buildings, args.vehicles]):
+            parser.error("--roads, --buildings, and --vehicles are required when not using --api")
+        # Run optimization pipeline
+        optimizer = GeospatialRouteOptimizer(args.osrm_url)
+        
+        try:
+            results = optimizer.process_ward_data(
+                roads_geojson=args.roads,
+                buildings_geojson=args.buildings,
+                vehicles_csv=args.vehicles,
+                output_dir=args.output
+            )
+            
+            print("\nRoute optimization completed successfully!")
+            print(f"Results saved to: {args.output}")
+            print(f"Interactive map: {results['route_map']}")
+            print(f"Summary report: {results['summary_csv']}")
+            
+        except Exception as e:
+            logger.error(f"❌ Pipeline failed: {e}")
+            sys.exit(1)
 
 if __name__ == "__main__":
     main()

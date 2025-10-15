@@ -52,12 +52,27 @@ class VRPSolver:
         distance = geometry.length
         G.add_edge(start_node, end_node, weight=distance, road_id=road_id, geometry=geometry)
     
-    def _calculate_distance_matrix(self, nodes: gpd.GeoDataFrame) -> np.ndarray:
-        """Calculate distance matrix between nodes using road network."""
+    def _calculate_distance_matrix(self, nodes: gpd.GeoDataFrame, use_osrm: bool = True) -> np.ndarray:
+        """Calculate distance matrix using OSRM or road network."""
         n = len(nodes)
         distance_matrix = np.zeros((n, n))
         
-        # Add nodes to graph temporarily
+        if use_osrm:
+            # Use OSRM for more accurate real-world distances
+            try:
+                from tools.osrm_routing import OSRMRouter
+                osrm = OSRMRouter()
+                
+                locations = [(node.geometry.x, node.geometry.y) for _, node in nodes.iterrows()]
+                distance_matrix = osrm.get_distance_matrix(locations)
+                
+                logger.info("Using OSRM distance matrix")
+                return distance_matrix
+                
+            except Exception as e:
+                logger.warning(f"OSRM failed, falling back to road network: {e}")
+        
+        # Fallback to road network calculation
         temp_nodes = []
         for idx, node in nodes.iterrows():
             node_id = f"temp_{idx}"
@@ -90,16 +105,34 @@ class VRPSolver:
                         )
                         distance_matrix[i][j] = path_length
                     except nx.NetworkXNoPath:
-                        # Use Euclidean distance as fallback
+                        # Use Haversine distance as fallback
                         node_i = nodes.iloc[i]
                         node_j = nodes.iloc[j]
-                        distance_matrix[i][j] = node_i.geometry.distance(node_j.geometry)
+                        distance_matrix[i][j] = self._haversine_distance(
+                            (node_i.geometry.x, node_i.geometry.y),
+                            (node_j.geometry.x, node_j.geometry.y)
+                        )
         
         # Remove temporary nodes
         for temp_node in temp_nodes:
-            self.graph.remove_node(temp_node)
+            if temp_node in self.graph:
+                self.graph.remove_node(temp_node)
         
         return distance_matrix
+    
+    def _haversine_distance(self, coord1, coord2):
+        """Calculate Haversine distance between two coordinates."""
+        R = 6371000  # Earth radius in meters
+        lat1, lon1 = np.radians(coord1[1]), np.radians(coord1[0])
+        lat2, lon2 = np.radians(coord2[1]), np.radians(coord2[0])
+        
+        dlat = lat2 - lat1
+        dlon = lon2 - lon1
+        
+        a = np.sin(dlat/2)**2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon/2)**2
+        c = 2 * np.arctan2(np.sqrt(a), np.sqrt(1-a))
+        
+        return R * c
     
     def solve_vrp(self, cluster_nodes: gpd.GeoDataFrame, vehicle_start_idx: int = 0) -> Optional[List[int]]:
         """

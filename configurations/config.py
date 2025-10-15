@@ -22,7 +22,7 @@ class Config:
     
     # API settings
     API_HOST: str = "127.0.0.1"
-    API_PORT: int = 7000
+    API_PORT: int = 8080
     
     # Logging
     LOG_LEVEL: str = "INFO"

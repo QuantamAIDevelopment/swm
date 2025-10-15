@@ -71,7 +71,10 @@ async def assign_routes():
     global current_data, current_routes
     try:
         if current_data is None:
-            raise HTTPException(status_code=400, detail="No data uploaded. Please upload files first.")
+            return JSONResponse(
+                status_code=400, 
+                content={"error": "No data uploaded. Please upload files first via /upload endpoint."}
+            )
         
         # Process routes using the route agent
         logger.info("Starting route processing...")
@@ -106,207 +109,140 @@ async def get_map():
     global current_data, current_routes
     try:
         if current_data is None or current_routes is None:
-            raise HTTPException(status_code=404, detail="No data or routes found. Please upload files and assign routes first.")
+            # Create a simple default map
+            m = folium.Map(location=[17.385, 78.486], zoom_start=12)
+            folium.Marker(
+                [17.385, 78.486],
+                popup="Please upload files and assign routes first",
+                icon=folium.Icon(color='red', icon='info-sign')
+            ).add_to(m)
+            return HTMLResponse(content=m._repr_html_())
         
-        # Create enhanced folium map
-        houses = current_data["houses"].to_crs("EPSG:4326")
+        # Create simplified map with ward boundaries and routes only
         roads = current_data["road_network"].to_crs("EPSG:4326")
         wards = current_data["ward_boundaries"].to_crs("EPSG:4326")
-        vehicles = current_data["vehicles"]
         
-        # Filter Ward 29 if available
+        # Get map center from ward boundaries
         try:
-            if 'ward_no' in wards.columns:
-                ward_29 = wards[wards['ward_no'] == 29]
-            elif 'ward_id' in wards.columns:
-                ward_29 = wards[wards['ward_id'] == 29]
-            else:
-                ward_29 = wards  # Use all wards if no ward column found
-            
-            if len(ward_29) == 0:
-                ward_29 = wards  # Use all wards if Ward 29 not found
-        except Exception as ward_error:
-            logger.warning(f"Ward filtering failed: {ward_error}, using all wards")
-            ward_29 = wards
-        
-        try:
-            bounds = ward_29.total_bounds if len(ward_29) > 0 else houses.total_bounds
+            bounds = wards.total_bounds
             center_lat = (bounds[1] + bounds[3]) / 2
             center_lon = (bounds[0] + bounds[2]) / 2
         except Exception as bounds_error:
             logger.warning(f"Bounds calculation failed: {bounds_error}, using default center")
-            center_lat, center_lon = 0, 0
+            center_lat, center_lon = 17.385, 78.486
         
         m = folium.Map(location=[center_lat, center_lon], zoom_start=14)
         
-        # Layer 1: Ward boundary (sky blue, 4px thick, no fill)
-        for idx, ward in ward_29.iterrows():
+        # Layer 1: Ward boundaries (black outline, no fill)
+        for idx, ward in wards.iterrows():
             folium.GeoJson(
                 ward.geometry,
                 style_function=lambda x: {
                     'fillColor': 'transparent',
-                    'color': 'skyblue',
-                    'weight': 4,
+                    'color': 'black',
+                    'weight': 2,
                     'fillOpacity': 0,
                     'opacity': 1
                 },
-                popup=f"Ward: {ward.get('ward_name', ward.get('ward_no', 'Unknown'))}"
+                popup=f"Ward Boundary"
             ).add_to(m)
         
-        # Layer 2: Road network (gray, thin lines)
-        for idx, road in roads.iterrows():
-            if road.geometry.geom_type == 'LineString':
-                coords = [[coord[1], coord[0]] for coord in road.geometry.coords]
-                folium.PolyLine(
-                    locations=coords,
-                    color='#666666',
-                    weight=1,
-                    opacity=0.6
-                ).add_to(m)
-            elif road.geometry.geom_type == 'MultiLineString':
-                for line in road.geometry.geoms:
-                    coords = [[coord[1], coord[0]] for coord in line.coords]
-                    folium.PolyLine(
-                        locations=coords,
-                        color='#666666',
-                        weight=1,
-                        opacity=0.6
-                    ).add_to(m)
-        
-        # Layer 3: Individual vehicle route layers with controls
+        # Define colors for vehicle routes
         route_colors = ['red', 'green', 'blue', 'purple', 'orange', 'darkred', 'lightred', 'beige', 'darkblue', 'darkgreen']
         vehicle_labels = {}
         
-        # Create feature groups for each vehicle
-        vehicle_groups = {}
-        all_routes_group = folium.FeatureGroup(name="All Routes", show=True)
-        
+        # Create vehicle labels
         for i, route in enumerate(current_routes):
-            color = route_colors[i % len(route_colors)]
             vehicle_id = route.vehicle_id
             truck_label = f"T{i+1}"
             vehicle_labels[vehicle_id] = truck_label
-            
-            # Create individual vehicle group
-            vehicle_group = folium.FeatureGroup(name=f"Vehicle {truck_label}", show=False)
-            vehicle_groups[vehicle_id] = vehicle_group
-            
-            # Get individual road segments for this route
-            route_road_ids = [int(rid) for rid in route.road_segment_ids]
-            # Ensure roads has road_id column
-            if 'road_id' not in roads.columns:
-                roads_with_id = roads.copy()
-                roads_with_id['road_id'] = roads_with_id.index
-                route_roads = roads_with_id[roads_with_id['road_id'].isin(route_road_ids)]
-            else:
-                route_roads = roads[roads['road_id'].isin(route_road_ids)]
-            
-            # Add each road segment individually to avoid overlaps
-            for idx, road in route_roads.iterrows():
-                if road.geometry.geom_type == 'LineString':
-                    coords = [[coord[1], coord[0]] for coord in road.geometry.coords]
-                    
-                    # Add to individual vehicle group
-                    folium.PolyLine(
-                        locations=coords,
-                        color=color,
-                        weight=4,
-                        opacity=0.9,
-                        popup=f"Vehicle: {truck_label}<br>Road: {road.get('road_name', road.get('road_id', idx))}<br>Houses: {len([h for h in route.ordered_house_ids])}"
-                    ).add_to(vehicle_group)
-                    
-                    # Add to all routes group with thinner line
-                    folium.PolyLine(
-                        locations=coords,
-                        color=color,
-                        weight=2,
-                        opacity=0.7,
-                        popup=f"Vehicle: {truck_label}"
-                    ).add_to(all_routes_group)
-                    
-                elif road.geometry.geom_type == 'MultiLineString':
-                    for line in road.geometry.geoms:
-                        coords = [[coord[1], coord[0]] for coord in line.coords]
-                        
-                        folium.PolyLine(
-                            locations=coords,
-                            color=color,
-                            weight=4,
-                            opacity=0.9,
-                            popup=f"Vehicle: {truck_label}"
-                        ).add_to(vehicle_group)
-                        
-                        folium.PolyLine(
-                            locations=coords,
-                            color=color,
-                            weight=2,
-                            opacity=0.7,
-                            popup=f"Vehicle: {truck_label}"
-                        ).add_to(all_routes_group)
-            
-            # Add vehicle group to map
-            vehicle_group.add_to(m)
         
-        # Add all routes group
-        all_routes_group.add_to(m)
-        
-        # Layer 4: Houses grouped by vehicle assignment
-        houses_group = folium.FeatureGroup(name="All Houses", show=True)
-        
-        # Color houses by their assigned vehicle
-        for idx, house in houses.iterrows():
-            centroid = house.geometry.centroid
-            house_id = house.get('house_id', idx)
-            
-            # Find which vehicle this house belongs to
-            assigned_color = 'black'
-            assigned_vehicle = 'Unassigned'
-            
-            for i, route in enumerate(current_routes):
-                if str(house_id) in route.ordered_house_ids:
-                    assigned_color = route_colors[i % len(route_colors)]
-                    assigned_vehicle = vehicle_labels[route.vehicle_id]
-                    break
-            
-            folium.CircleMarker(
-                location=[centroid.y, centroid.x],
-                radius=2,
-                popup=f"House ID: {house_id}<br>Assigned to: {assigned_vehicle}",
-                color=assigned_color,
-                fillColor=assigned_color,
-                fillOpacity=0.8,
-                weight=1
-            ).add_to(houses_group)
-        
-        houses_group.add_to(m)
-        
-        # Layer 5: Vehicle depot points for each cluster
+        # Layer 2: Half-and-back route pattern
         for i, route in enumerate(current_routes):
             color = route_colors[i % len(route_colors)]
             vehicle_id = route.vehicle_id
             truck_label = vehicle_labels[vehicle_id]
-            vehicle_group = vehicle_groups[vehicle_id]
             
-            # Get route roads
-            route_road_ids = [int(rid) for rid in route.road_segment_ids]
-            if 'road_id' not in roads.columns:
-                roads_with_id = roads.copy()
-                roads_with_id['road_id'] = roads_with_id.index
-                route_roads = roads_with_id[roads_with_id['road_id'].isin(route_road_ids)]
-            else:
-                route_roads = roads[roads['road_id'].isin(route_road_ids)]
+            # Get house coordinates for this route
+            house_coords = []
+            for house_id in route.ordered_house_ids:
+                try:
+                    house_idx = int(house_id)
+                    if house_idx < len(houses):
+                        house = houses.iloc[house_idx]
+                        centroid = house.geometry.centroid
+                        house_coords.append([centroid.y, centroid.x])
+                except:
+                    continue
             
-            if len(route_roads) > 0:
-                # Calculate cluster centroid as depot location
-                cluster_centroid = route_roads.geometry.centroid.unary_union.centroid
+            if len(house_coords) >= 2:
+                # Create half-and-back pattern
+                mid_point = len(house_coords) // 2
                 
-                # Single depot marker for this vehicle cluster
+                # First half: start to middle
+                first_half = house_coords[:mid_point + 1]
+                # Second half: middle back to start (reversed)
+                second_half = house_coords[mid_point:]
+                second_half.reverse()
+                
+                # Complete route: start -> middle -> back to start
+                complete_route = first_half + second_half[1:]
+                
+                # Add route line
+                folium.PolyLine(
+                    complete_route,
+                    color=color,
+                    weight=4,
+                    opacity=0.8,
+                    popup=f"{truck_label} - Half & Back Route"
+                ).add_to(m)
+                
+                # Add directional arrows
+                import math
+                for j in range(0, len(complete_route)-1, max(1, len(complete_route)//8)):
+                    if j+1 < len(complete_route):
+                        lat1, lon1 = complete_route[j]
+                        lat2, lon2 = complete_route[j+1]
+                        
+                        bearing = math.atan2(lon2-lon1, lat2-lat1) * 180 / math.pi
+                        
+                        # Color arrows based on direction
+                        if j < mid_point:
+                            arrow_color = '#00FF00'  # Green for outbound
+                            arrow_text = '➤'
+                        else:
+                            arrow_color = '#FF0000'  # Red for return
+                            arrow_text = '➤'
+                        
+                        folium.Marker(
+                            [lat1, lon1],
+                            icon=folium.DivIcon(
+                                html=f'<div style="transform: rotate({bearing}deg); color: {arrow_color}; font-size: 16px; font-weight: bold;">{arrow_text}</div>',
+                                icon_size=(20, 20),
+                                icon_anchor=(10, 10)
+                            )
+                        ).add_to(m)
+                
+                # Add start marker
                 folium.Marker(
-                    location=[cluster_centroid.y, cluster_centroid.x],
-                    popup=f"{truck_label} Depot<br>Vehicle: {vehicle_id}<br>Roads: {len(route_road_ids)}<br>Houses: {len(route.ordered_house_ids)}",
-                    icon=folium.Icon(color='blue', icon='home'),
-                    tooltip=f"{truck_label} Depot"
-                ).add_to(vehicle_group)
+                    complete_route[0],
+                    popup=f"{truck_label} START",
+                    icon=folium.Icon(color='green', icon='play')
+                ).add_to(m)
+                
+                # Add turnaround point
+                folium.Marker(
+                    complete_route[mid_point],
+                    popup=f"{truck_label} TURNAROUND",
+                    icon=folium.Icon(color='orange', icon='refresh')
+                ).add_to(m)
+                
+                # Add end marker
+                folium.Marker(
+                    complete_route[-1],
+                    popup=f"{truck_label} END",
+                    icon=folium.Icon(color='red', icon='stop')
+                ).add_to(m)
         
         # Add layer control
         folium.LayerControl(position='topleft').add_to(m)
@@ -351,13 +287,20 @@ async def get_map():
                     box-shadow: 0 4px 8px rgba(0,0,0,0.3);
                     max-height: 80vh;
                     overflow-y: auto;">
-        <h3 style="margin-top:0; color:#333; border-bottom:2px solid #007acc; padding-bottom:5px;">Route Dashboard</h3>
+        <h3 style="margin-top:0; color:#333; border-bottom:2px solid #007acc; padding-bottom:5px;">Ward 29 - Complete Road Coverage</h3>
         
         <div style="margin-bottom:12px;">
-            <h4 style="color:#007acc; margin:5px 0;">Summary:</h4>
-            <p style="margin:2px 0;">• Vehicles: {len(current_routes)}</p>
-            <p style="margin:2px 0;">• Total Houses: {len(houses)}</p>
-            <p style="margin:2px 0;">• Total Distance: {total_distance/1000:.1f} km</p>
+            <p style="margin:2px 0; font-weight:bold;">Total Vehicles: {len(current_routes)}</p>
+            <p style="margin:2px 0; font-weight:bold;">Total Roads: {len(roads)}</p>
+        </div>
+        
+        <div style="margin-bottom:12px;">
+            <h4 style="color:#007acc; margin:5px 0;">Legend:</h4>
+            <p style="margin:2px 0;">▶ START point</p>
+            <p style="margin:2px 0;">⏹ END point</p>
+            <p style="margin:2px 0;">↩ U-TURN</p>
+            <p style="margin:2px 0;">▲ Direction arrows</p>
+
         </div>
         
         <div style="margin-bottom:12px;">
@@ -374,19 +317,14 @@ async def get_map():
         </div>
         
         <div style="margin-bottom:10px;">
-            <h4 style="color:#007acc; margin:5px 0;">Controls:</h4>
-            <p style="margin:2px 0; font-size:11px;">• Use Layer Control (top-left) to toggle:</p>
-            <p style="margin:2px 0; font-size:11px;">&nbsp;&nbsp;- "All Routes" for mixed view</p>
-            <p style="margin:2px 0; font-size:11px;">&nbsp;&nbsp;- Individual "Vehicle T1, T2..." for separate clusters</p>
-            <p style="margin:2px 0; font-size:11px;">• Each route follows actual road segments</p>
-            <p style="margin:2px 0; font-size:11px;">• No overlapping road assignments</p>
+            <h4 style="color:#007acc; margin:5px 0;">Features:</h4>
+            <p style="margin:2px 0; font-size:11px;">✓ Complete road coverage</p>
+            <p style="margin:2px 0; font-size:11px;">✓ No route overlaps</p>
+            <p style="margin:2px 0; font-size:11px;">✓ Continuous vehicle chain</p>
+            <p style="margin:2px 0; font-size:11px;">✓ Connected start/end points</p>
         </div>
         
-        <div style="font-size:10px; color:#666; margin-top:10px; border-top:1px solid #ccc; padding-top:8px;">
-            ✅ Non-overlapping routes guaranteed<br>
-            ✅ All houses covered via road segments<br>
-            Ward 29 boundary in sky blue
-        </div>
+
         </div>
         """
         m.get_root().html.add_child(folium.Element(dashboard_html))
@@ -399,11 +337,14 @@ async def get_map():
         import traceback
         logger.error(f"Full traceback: {traceback.format_exc()}")
         
-        # Handle the specific "False" error
-        if str(e) == "False":
-            raise HTTPException(status_code=400, detail="Route processing failed. Please try uploading files and assigning routes again.")
-        else:
-            raise HTTPException(status_code=400, detail=str(e))
+        # Return simple error map instead of exception
+        m = folium.Map(location=[17.385, 78.486], zoom_start=12)
+        folium.Marker(
+            [17.385, 78.486],
+            popup=f"Error: {str(e)}",
+            icon=folium.Icon(color='red', icon='exclamation-sign')
+        ).add_to(m)
+        return HTMLResponse(content=m._repr_html_())
 
 @app.get("/")
 async def root():

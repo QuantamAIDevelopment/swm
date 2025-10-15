@@ -18,7 +18,7 @@ class ImprovedClustering:
     def create_geographic_clusters(self, roads: gpd.GeoDataFrame, 
                                  snapped_houses: gpd.GeoDataFrame, 
                                  n_clusters: int) -> List[List]:
-        """Create clusters ensuring houses are within their cluster's geographic zone."""
+        """Create optimized K-means clusters for garbage collection routes."""
         
         house_counts = snapped_houses.groupby('road_id').size().to_dict()
         all_road_ids = list(roads['road_id'].unique())
@@ -26,49 +26,66 @@ class ImprovedClustering:
         if len(all_road_ids) <= n_clusters:
             return [[road_id] for road_id in all_road_ids[:n_clusters]]
         
-        # Step 1: Initial spatial clustering
-        initial_clusters = self._spatial_clustering(roads, snapped_houses, n_clusters)
+        # Step 1: K-means clustering on house locations
+        kmeans_clusters = self._kmeans_clustering(snapped_houses, n_clusters)
         
-        # Step 2: Create geographic zones for each cluster
-        cluster_zones = self._create_cluster_zones(initial_clusters, roads)
+        # Step 2: Assign roads to clusters based on house assignments
+        road_clusters = self._assign_roads_to_clusters(kmeans_clusters, snapped_houses, roads)
         
-        # Step 3: Reassign houses to ensure they're within their cluster's zone
-        final_clusters = self._enforce_geographic_constraints(
-            initial_clusters, cluster_zones, roads, snapped_houses
-        )
-        
-        # Step 4: Balance clusters
-        balanced_clusters = self._balance_clusters(final_clusters, roads, snapped_houses)
+        # Step 3: Balance clusters for optimal route distribution
+        balanced_clusters = self._balance_clusters(road_clusters, roads, snapped_houses)
         
         # Log results
         for i, cluster in enumerate(balanced_clusters):
             cluster_houses = sum(house_counts.get(road_id, 0) for road_id in cluster)
-            logger.info(f"Geographic cluster {i}: {len(cluster)} roads, {cluster_houses} houses")
+            logger.info(f"K-means cluster {i}: {len(cluster)} roads, {cluster_houses} houses")
         
         return balanced_clusters
     
-    def _spatial_clustering(self, roads: gpd.GeoDataFrame, 
-                          snapped_houses: gpd.GeoDataFrame, 
-                          n_clusters: int) -> List[List]:
-        """Initial K-means clustering based on house locations."""
+    def _kmeans_clustering(self, snapped_houses: gpd.GeoDataFrame, 
+                          n_clusters: int) -> np.ndarray:
+        """Perform K-means clustering on house locations."""
         
+        # Extract coordinates
         house_coords = []
         for _, house in snapped_houses.iterrows():
             centroid = house.geometry.centroid
             house_coords.append([centroid.x, centroid.y])
         
-        kmeans = KMeans(n_clusters=n_clusters, random_state=self.random_seed, n_init=20)
-        house_labels = kmeans.fit_predict(house_coords)
+        house_coords = np.array(house_coords)
         
-        # Assign roads to clusters based on their houses
+        # Apply K-means with multiple initializations for better results
+        kmeans = KMeans(
+            n_clusters=n_clusters, 
+            random_state=self.random_seed, 
+            n_init=20,
+            max_iter=300,
+            algorithm='lloyd'
+        )
+        
+        cluster_labels = kmeans.fit_predict(house_coords)
+        
+        logger.info(f"K-means clustering completed with {n_clusters} clusters")
+        logger.info(f"Cluster sizes: {np.bincount(cluster_labels)}")
+        
+        return cluster_labels
+    
+    def _assign_roads_to_clusters(self, house_labels: np.ndarray, 
+                                 snapped_houses: gpd.GeoDataFrame,
+                                 roads: gpd.GeoDataFrame) -> List[List]:
+        """Assign roads to clusters based on house cluster assignments."""
+        
+        n_clusters = len(np.unique(house_labels))
         road_cluster_votes = {road_id: [0] * n_clusters for road_id in roads['road_id']}
         
+        # Vote for road assignments based on house clusters
         for idx, house in snapped_houses.iterrows():
             road_id = house['road_id']
             cluster_label = house_labels[idx]
             if road_id in road_cluster_votes:
                 road_cluster_votes[road_id][cluster_label] += 1
         
+        # Assign roads to clusters with highest votes
         clusters = [[] for _ in range(n_clusters)]
         for road_id, votes in road_cluster_votes.items():
             if sum(votes) > 0:
@@ -133,9 +150,10 @@ class ImprovedClustering:
             
             if best_cluster != current_cluster and best_cluster is not None:
                 # Move road to better cluster
-                clusters[current_cluster].remove(road_id)
-                clusters[best_cluster].append(road_id)
-                road_to_cluster[road_id] = best_cluster
+                if road_id in clusters[current_cluster]:
+                    clusters[current_cluster].remove(road_id)
+                    clusters[best_cluster].append(road_id)
+                    road_to_cluster[road_id] = best_cluster
         
         logger.info(f"Fixed {len(violations)} geographic constraint violations")
         return clusters
