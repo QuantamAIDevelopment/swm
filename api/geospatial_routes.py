@@ -19,6 +19,8 @@ import math
 from services.vehicle_service import VehicleService
 from api.vehicles_api import router as vehicles_router
 from routing.capacity_optimizer import CapacityRouteOptimizer
+from routing.hierarchical_clustering import HierarchicalSpatialClustering
+from data_processing.load_road_network import RoadNetworkLoader
 from loguru import logger
 
 # API Key for authentication - Change this in production!
@@ -476,6 +478,76 @@ async def get_cluster_dashboard(api_key: str = Depends(verify_api_key)):
         })
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Dashboard error: {str(e)}")
+
+@app.get("/cluster-roads")
+async def get_cluster_roads():
+    """Get clusters with road coordinates for each cluster."""
+    try:
+        # Check if files exist
+        buildings_path = "output/buildings.geojson"
+        roads_path = "output/roads.geojson"
+        
+        if not os.path.exists(buildings_path) or not os.path.exists(roads_path):
+            raise HTTPException(status_code=404, detail="Data not found. Upload files first using /optimize-routes")
+        
+        # Load data
+        buildings_gdf = gpd.read_file(buildings_path)
+        roads_gdf = gpd.read_file(roads_path)
+        
+        if buildings_gdf.crs != 'EPSG:4326':
+            buildings_gdf = buildings_gdf.to_crs('EPSG:4326')
+        if roads_gdf.crs != 'EPSG:4326':
+            roads_gdf = roads_gdf.to_crs('EPSG:4326')
+        
+        # Build road network
+        road_loader = RoadNetworkLoader()
+        road_loader.road_gdf = roads_gdf
+        road_network = road_loader.build_networkx_graph()
+        
+        # Get building coordinates
+        building_coords = [(pt.x, pt.y) for pt in buildings_gdf.geometry.centroid]
+        
+        # Create clusters with road coordinates
+        clustering = HierarchicalSpatialClustering(road_network=road_network)
+        num_vehicles = min(5, len(building_coords))
+        trips_per_vehicle = [1] * num_vehicles
+        
+        clusters = clustering.create_non_overlapping_clusters(
+            building_coords, num_vehicles, trips_per_vehicle
+        )
+        
+        # Format response
+        cluster_response = {}
+        for cluster_id, cluster_data in clusters.items():
+            cluster_response[f"cluster_{cluster_id + 1}"] = {
+                "cluster_id": cluster_id + 1,
+                "vehicle_idx": cluster_data['vehicle_idx'],
+                "trip_idx": cluster_data['trip_idx'],
+                "house_count": len(cluster_data['houses']),
+                "house_coordinates": [
+                    {"lat": coord[1], "lon": coord[0]} 
+                    for coord in cluster_data['coordinates']
+                ],
+                "road_coordinates": [
+                    [
+                        {"lat": coord[1], "lon": coord[0]} 
+                        for coord in road_coords
+                    ] for road_coords in cluster_data['road_coordinates']
+                ]
+            }
+        
+        return JSONResponse({
+            "status": "success",
+            "total_clusters": len(clusters),
+            "total_buildings": len(building_coords),
+            "clusters": cluster_response
+        })
+        
+    except Exception as e:
+        import traceback
+        error_details = traceback.format_exc()
+        print(f"Cluster roads error: {error_details}")
+        raise HTTPException(status_code=500, detail=f"Error getting cluster roads: {str(e)}")
 
 @app.get("/clusters")
 async def get_all_clusters(api_key: str = Depends(verify_api_key)):
@@ -1060,6 +1132,7 @@ async def root():
                 <li><strong>GET /cluster-dashboard</strong> - Get cluster data in JSON format</li>
                 <li><strong>GET /cluster/{cluster_id}</strong> - Get specific cluster details</li>
                 <li><strong>GET /clusters</strong> - Get all clusters data</li>
+                <li><strong>GET /cluster-roads</strong> - Get clusters with road coordinates for each cluster</li>
                 <li><strong>GET /api/vehicles/live</strong> - Get live vehicle data from SWM API</li>
                 <li><strong>GET /api/vehicles/{vehicle_id}</strong> - Get specific vehicle details</li>
                 <li><strong>PUT /api/vehicles/{vehicle_id}/status</strong> - Update vehicle status</li>

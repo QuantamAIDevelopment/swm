@@ -5,8 +5,9 @@ from sklearn.cluster import KMeans
 from scipy.spatial.distance import cdist
 
 class HierarchicalSpatialClustering:
-    def __init__(self):
+    def __init__(self, road_network=None):
         self.clusters = {}
+        self.road_network = road_network
         
     def create_non_overlapping_clusters(self, coordinates: List[Tuple], num_vehicles: int, trips_per_vehicle: List[int]) -> Dict:
         """Create hierarchical clusters like states divided in a country."""
@@ -31,11 +32,15 @@ class HierarchicalSpatialClustering:
             
             # Assign trip clusters to hierarchical structure
             for trip_idx, trip_houses in enumerate(trip_clusters):
+                cluster_coords = [coordinates[i] for i in trip_houses]
+                road_coords = self._get_cluster_roads(cluster_coords)
+                
                 hierarchical_clusters[cluster_id] = {
                     'vehicle_idx': vehicle_idx,
                     'trip_idx': trip_idx,
                     'houses': trip_houses,
-                    'coordinates': [coordinates[i] for i in trip_houses]
+                    'coordinates': cluster_coords,
+                    'road_coordinates': road_coords
                 }
                 cluster_id += 1
         
@@ -88,8 +93,10 @@ class HierarchicalSpatialClustering:
             
             if len(houses) <= max_houses_per_cluster:
                 # Cluster is within capacity
+                road_coords = self._get_cluster_roads(coordinates)
                 balanced_clusters[cluster_id] = cluster_data.copy()
                 balanced_clusters[cluster_id]['cluster_id'] = cluster_id
+                balanced_clusters[cluster_id]['road_coordinates'] = road_coords
                 cluster_id += 1
             else:
                 # Split oversized cluster
@@ -97,13 +104,46 @@ class HierarchicalSpatialClustering:
                 split_clusters = self._subdivide_cluster(coordinates, houses, num_splits)
                 
                 for split_houses in split_clusters:
+                    split_coords = [coordinates[houses.index(h)] for h in split_houses if h in houses]
+                    road_coords = self._get_cluster_roads(split_coords)
+                    
                     balanced_clusters[cluster_id] = {
                         'vehicle_idx': cluster_data['vehicle_idx'],
                         'trip_idx': cluster_data['trip_idx'],
                         'houses': split_houses,
-                        'coordinates': [coordinates[houses.index(h)] for h in split_houses if h in houses],
-                        'cluster_id': cluster_id
+                        'coordinates': split_coords,
+                        'cluster_id': cluster_id,
+                        'road_coordinates': road_coords
                     }
                     cluster_id += 1
         
         return balanced_clusters
+    
+    def _get_cluster_roads(self, cluster_coords: List[Tuple]) -> List[List[Tuple]]:
+        """Get road coordinates within cluster bounds."""
+        if not self.road_network or not cluster_coords:
+            return []
+        
+        # Create bounding box
+        min_x = min(coord[0] for coord in cluster_coords)
+        max_x = max(coord[0] for coord in cluster_coords)
+        min_y = min(coord[1] for coord in cluster_coords)
+        max_y = max(coord[1] for coord in cluster_coords)
+        
+        road_coordinates = []
+        
+        # Find roads within cluster bounds
+        for edge in self.road_network.edges(data=True):
+            start_node, end_node, edge_data = edge
+            
+            # Check if road intersects cluster area
+            if ((min_x <= start_node[0] <= max_x and min_y <= start_node[1] <= max_y) or
+                (min_x <= end_node[0] <= max_x and min_y <= end_node[1] <= max_y)):
+                
+                # Get full road geometry if available
+                if 'geometry' in edge_data and hasattr(edge_data['geometry'], 'coords'):
+                    road_coordinates.append(list(edge_data['geometry'].coords))
+                else:
+                    road_coordinates.append([start_node, end_node])
+        
+        return road_coordinates
