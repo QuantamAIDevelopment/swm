@@ -12,25 +12,31 @@ class RouteComputer:
         self.road_graph = road_graph
         
     def compute_cluster_routes(self, clustered_buildings: gpd.GeoDataFrame, depot_location: tuple = None) -> dict:
-        """Compute optimal routes for each cluster using OR-Tools VRP."""
+        """Compute chained routes where each vehicle's end connects to next vehicle's start."""
         routes = {}
+        cluster_ids = sorted(clustered_buildings['cluster'].unique())
+        previous_end = depot_location
         
-        for cluster_id in clustered_buildings['cluster'].unique():
+        for i, cluster_id in enumerate(cluster_ids):
             cluster_buildings = clustered_buildings[clustered_buildings['cluster'] == cluster_id]
             
             if len(cluster_buildings) == 0:
                 continue
-                
-            # Use first building as depot if not specified
-            if depot_location is None:
-                depot = cluster_buildings.iloc[0]['road_node']
-            else:
-                depot = depot_location
             
-            route = self._solve_vrp_for_cluster(cluster_buildings, depot)
+            # Use previous vehicle's end as this vehicle's start
+            if previous_end is None:
+                start_point = cluster_buildings.iloc[0]['road_node']
+            else:
+                start_point = previous_end
+            
+            route = self._solve_vrp_for_cluster(cluster_buildings, start_point)
             routes[cluster_id] = route
             
-        logger.info(f"Computed routes for {len(routes)} clusters")
+            # Set end point for next vehicle
+            if route['nodes']:
+                previous_end = route['nodes'][-1]
+            
+        logger.info(f"Computed {len(routes)} chained vehicle routes")
         return routes
     
     def _solve_vrp_for_cluster(self, buildings: gpd.GeoDataFrame, depot: tuple) -> dict:
@@ -140,6 +146,10 @@ class RouteComputer:
             else:
                 all_coords = [(0, 0), (0, 0)]
         
+        # Ensure valid geometry
+        if len(all_coords) < 2:
+            all_coords = route_nodes[:2] if len(route_nodes) >= 2 else [(0, 0), (0, 0)]
+        
         return {
             'nodes': route_nodes,
             'paths': route_paths,
@@ -186,6 +196,10 @@ class RouteComputer:
                 all_coords = locations[:2] if len(locations) >= 2 else [locations[0], locations[0]]
             else:
                 all_coords = [(0, 0), (0, 0)]
+        
+        # Ensure valid geometry
+        if len(all_coords) < 2:
+            all_coords = locations[:2] if len(locations) >= 2 else [(0, 0), (0, 0)]
         
         return {
             'nodes': locations,

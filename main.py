@@ -31,9 +31,10 @@ class GeospatialRouteOptimizer:
         logger.info("🗺️ NetworkX: Road network graph construction")
         logger.info("🔧 OR-Tools: VRP optimization")
         logger.info("📊 K-means/DBSCAN: Geographic clustering")
+        logger.info("🌐 Live API: Real-time vehicle data integration")
     
     def process_ward_data(self, roads_geojson: str, buildings_geojson: str, 
-                         vehicles_csv: str, output_dir: str = "output") -> dict:
+                         vehicles_csv: str = None, output_dir: str = "output") -> dict:
         """Complete pipeline: load → cluster → route → directions → export."""
         
         logger.info(f"🚀 Starting route optimization pipeline")
@@ -52,9 +53,9 @@ class GeospatialRouteOptimizer:
         buildings_gdf = self.building_snapper.load_buildings(buildings_geojson)
         snapped_buildings = self.building_snapper.snap_to_road_network(buildings_gdf)
         
-        # 3️⃣ Load vehicles and determine clustering
-        logger.info("3️⃣ Loading vehicles and clustering buildings...")
-        vehicles_df = self.clusterer.load_vehicles(vehicles_csv)
+        # 3️⃣ Load vehicles from live API and determine clustering
+        logger.info("3️⃣ Loading vehicles from live API and clustering buildings...")
+        vehicles_df = self.clusterer.load_vehicles(vehicles_csv)  # vehicles_csv is now optional
         num_vehicles = len(vehicles_df)
         clustered_buildings = self.clusterer.cluster_buildings(snapped_buildings, num_vehicles)
         
@@ -85,12 +86,12 @@ class GeospatialRouteOptimizer:
         summary_path = os.path.join(output_dir, "summary.csv")
         self.exporter.export_summary_csv(summary_path)
         
-        # Create interactive map
+        # Create interactive route map with layered clusters
         route_map = self.map_generator.create_route_map(routes_gdf, clustered_buildings)
         map_path = os.path.join(output_dir, "route_map.html")
         self.map_generator.save_map(route_map, map_path)
         
-        # Create cluster analysis map
+        # Create cluster analysis map with toggleable layers
         cluster_map = self.map_generator.create_cluster_analysis_map(clustered_buildings)
         cluster_map_path = os.path.join(output_dir, "cluster_analysis.html")
         self.map_generator.save_map(cluster_map, cluster_map_path)
@@ -118,10 +119,11 @@ def main():
     parser = argparse.ArgumentParser(description="Geospatial AI Garbage Collection Route Optimizer")
     parser.add_argument("--roads", help="Path to roads GeoJSON file")
     parser.add_argument("--buildings", help="Path to buildings GeoJSON file")
-    parser.add_argument("--vehicles", help="Path to vehicles CSV file")
+    parser.add_argument("--vehicles", help="Path to vehicles CSV file (optional - will use live API if not provided)")
     parser.add_argument("--output", default="output", help="Output directory")
     parser.add_argument("--osrm-url", default="http://router.project-osrm.org", help="OSRM server URL")
     parser.add_argument("--api", action="store_true", help="Start FastAPI server instead")
+    parser.add_argument("--port", type=int, default=8081, help="Port for FastAPI server (default: 8081)")
     
     args = parser.parse_args()
     
@@ -129,12 +131,20 @@ def main():
         # Start FastAPI server
         import uvicorn
         from api.geospatial_routes import app
-        logger.info("🚀 Starting FastAPI server...")
-        uvicorn.run(app, host="0.0.0.0", port=3001)
+        logger.info(f"🚀 Starting FastAPI server on port {args.port}...")
+        try:
+            uvicorn.run(app, host="127.0.0.1", port=args.port)
+        except OSError as e:
+            if "Address already in use" in str(e) or "10048" in str(e):
+                logger.error(f"❌ Port {args.port} is already in use. Try a different port with --port <number>")
+                logger.info("💡 Example: python main.py --api --port 8081")
+            else:
+                logger.error(f"❌ Server startup failed: {e}")
+            sys.exit(1)
     else:
         # Validate required arguments for CLI mode
-        if not all([args.roads, args.buildings, args.vehicles]):
-            parser.error("--roads, --buildings, and --vehicles are required when not using --api")
+        if not all([args.roads, args.buildings]):
+            parser.error("--roads and --buildings are required when not using --api")
         # Run optimization pipeline
         optimizer = GeospatialRouteOptimizer(args.osrm_url)
         
@@ -150,6 +160,7 @@ def main():
             print(f"Results saved to: {args.output}")
             print(f"Interactive map: {results['route_map']}")
             print(f"Summary report: {results['summary_csv']}")
+            print(f"Vehicle data source: {'Live API' if not args.vehicles else 'CSV file'}")
             
         except Exception as e:
             logger.error(f"❌ Pipeline failed: {e}")

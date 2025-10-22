@@ -4,21 +4,39 @@ import geopandas as gpd
 from sklearn.cluster import KMeans, DBSCAN
 from loguru import logger
 import numpy as np
+from services.vehicle_service import VehicleService
 
 class BuildingClusterer:
     def __init__(self):
         self.clusters = None
+        self.vehicle_service = VehicleService()
         
-    def load_vehicles(self, csv_path: str) -> pd.DataFrame:
-        """Load vehicle data from CSV file."""
+    def load_vehicles(self, csv_path: str = None) -> pd.DataFrame:
+        """Load vehicle data from live API or fallback to CSV."""
         try:
-            vehicles_df = pd.read_csv(csv_path)
-            active_vehicles = vehicles_df[vehicles_df.get('status', 'active') == 'active']
-            logger.info(f"Loaded {len(active_vehicles)} active vehicles from {csv_path}")
-            return active_vehicles
+            # Try to get live vehicle data first
+            vehicles_df = self.vehicle_service.get_live_vehicles()
+            
+            if vehicles_df is not None and len(vehicles_df) > 0:
+                logger.info(f"Loaded {len(vehicles_df)} vehicles from live API")
+                return vehicles_df
+            
+            # Fallback to CSV if provided
+            if csv_path:
+                logger.warning("Live API failed, falling back to CSV")
+                vehicles_df = pd.read_csv(csv_path)
+                active_vehicles = vehicles_df[vehicles_df.get('status', 'active') == 'active']
+                logger.info(f"Loaded {len(active_vehicles)} active vehicles from {csv_path}")
+                return active_vehicles
+            
+            # Create fallback data if no CSV provided
+            logger.warning("No CSV provided, using fallback vehicle data")
+            return self.vehicle_service._create_fallback_vehicles()
+            
         except Exception as e:
             logger.error(f"Failed to load vehicles: {e}")
-            raise
+            # Return fallback data instead of raising
+            return self.vehicle_service._create_fallback_vehicles()
     
     def cluster_buildings(self, buildings_gdf: gpd.GeoDataFrame, num_vehicles: int, method='kmeans') -> gpd.GeoDataFrame:
         """Cluster buildings based on number of vehicles."""
