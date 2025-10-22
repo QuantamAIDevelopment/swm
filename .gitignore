@@ -159,6 +159,9 @@ temp/
 logs/
 *.db
 *.sqlite
+output/
+*.html
+*.json
 
 # Docker
 .dockerignore

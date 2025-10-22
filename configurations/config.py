@@ -16,6 +16,10 @@ class Config:
     VRP_TIME_LIMIT_SECONDS: int = 30
     VRP_VEHICLE_CAPACITY: int = 999999  # Effectively infinite as per spec
     
+    # Vehicle capacity settings
+    HOUSES_PER_VEHICLE_PER_TRIP: int = 500
+    MAX_TRIPS_PER_DAY: int = 3
+    
     # File upload settings
     MAX_FILE_SIZE_MB: int = 100
     UPLOAD_DIR: str = "uploads"

@@ -18,6 +18,7 @@ from scipy.spatial.distance import cdist
 import math
 from services.vehicle_service import VehicleService
 from api.vehicles_api import router as vehicles_router
+from routing.capacity_optimizer import CapacityRouteOptimizer
 from loguru import logger
 
 # API Key for authentication - Change this in production!
@@ -64,7 +65,8 @@ async def optimize_routes(
     roads_file: UploadFile = File(..., description="Roads GeoJSON file"),
     buildings_file: UploadFile = File(..., description="Buildings GeoJSON file"), 
     ward_geojson: UploadFile = File(..., description="Ward boundary GeoJSON file"),
-    ward_no: str = Form(..., description="Ward number to filter vehicles")
+    ward_no: str = Form(..., description="Ward number to filter vehicles"),
+    vehicles_csv: UploadFile = File(None, description="Optional: Custom vehicles CSV file")
 ):
     """Upload files and run complete route optimization pipeline."""
     
@@ -91,24 +93,58 @@ async def optimize_routes(
             with open(ward_path, "wb") as f:
                 shutil.copyfileobj(ward_geojson.file, f)
             
-            # Get live vehicle data filtered by ward
+            # Load geospatial data
+            buildings_gdf = gpd.read_file(buildings_path)
+            roads_gdf = gpd.read_file(roads_path)
+            
+            # Convert to WGS84 if needed
+            if buildings_gdf.crs != 'EPSG:4326':
+                buildings_gdf = buildings_gdf.to_crs('EPSG:4326')
+            if roads_gdf.crs != 'EPSG:4326':
+                roads_gdf = roads_gdf.to_crs('EPSG:4326')
+            
+            # Get vehicle data - use uploaded CSV or live API data
             try:
-                vehicles_df = vehicle_service.get_vehicles_by_ward(ward_no.strip())
-                print(f"Loaded {len(vehicles_df)} vehicles for ward {ward_no}")
+                if vehicles_csv and vehicles_csv.filename:
+                    # Use uploaded CSV file
+                    if not vehicles_csv.filename.endswith('.csv'):
+                        raise HTTPException(status_code=400, detail="Vehicles file must be CSV format")
+                    
+                    vehicles_csv_path = os.path.join(temp_dir, "vehicles.csv")
+                    with open(vehicles_csv_path, "wb") as f:
+                        shutil.copyfileobj(vehicles_csv.file, f)
+                    
+                    vehicles_df = pd.read_csv(vehicles_csv_path)
+                    print(f"Loaded {len(vehicles_df)} vehicles from uploaded CSV")
+                    vehicles_path = vehicles_csv_path
+                    vehicle_source = "Uploaded CSV"
+                else:
+                    # Use live API data filtered by ward
+                    vehicles_df = vehicle_service.get_vehicles_by_ward(ward_no.strip())
+                    print(f"Loaded {len(vehicles_df)} vehicles for ward {ward_no}")
+                    
+                    # Save vehicle data for map generation
+                    vehicles_csv_path = os.path.join(temp_dir, "vehicles.csv")
+                    vehicles_df.to_csv(vehicles_csv_path, index=False)
+                    vehicles_path = vehicles_csv_path
+                    vehicle_source = "Live API (Ward Filtered)"
                 
                 if len(vehicles_df) == 0:
-                    raise HTTPException(status_code=404, detail=f"No active vehicles found for ward {ward_no}")
+                    raise HTTPException(status_code=404, detail=f"No vehicles found")
                 
-                # Save vehicle data for map generation
-                vehicles_csv_path = os.path.join(temp_dir, "vehicles.csv")
-                vehicles_df.to_csv(vehicles_csv_path, index=False)
-                vehicles_path = vehicles_csv_path
+                # Optimize routes with capacity constraints
+                optimizer = CapacityRouteOptimizer()
+                optimization_result = optimizer.optimize_routes_with_capacity(
+                    buildings_gdf, vehicles_df, roads_gdf
+                )
+                
+                print(f"Route optimization completed: {optimization_result['active_vehicles']} active vehicles, {optimization_result['total_houses']} houses")
                 
             except HTTPException:
                 raise
             except Exception as vehicle_error:
-                print(f"Failed to get live vehicle data: {vehicle_error}")
-                raise HTTPException(status_code=500, detail="Failed to get vehicle data from API")
+                print(f"Failed to get vehicle data: {vehicle_error}")
+                raise HTTPException(status_code=500, detail="Failed to get vehicle data")
             
             # Generate map using uploaded files
             try:
@@ -136,36 +172,55 @@ async def optimize_routes(
             shutil.copy(roads_path, "output/roads.geojson")
             shutil.copy(vehicles_path, "output/vehicles.csv")
             
-            # Prepare vehicle data for response
+            # Prepare optimized route data for response
+            active_vehicles = vehicles_df[
+                vehicles_df['status'].str.upper().isin(['ACTIVE', 'AVAILABLE', 'ONLINE'])
+            ]
+            
             vehicle_data = []
-            for _, vehicle in vehicles_df.iterrows():
+            route_summary = []
+            
+            for vehicle_id, assignment in optimization_result['route_assignments'].items():
+                vehicle_info = assignment['vehicle_info']
                 vehicle_data.append({
-                    "vehicle_id": str(vehicle.get('vehicle_id', 'N/A')),
-                    "vehicle_type": str(vehicle.get('vehicle_type', 'N/A')),
-                    "status": str(vehicle.get('status', 'N/A')),
-                    "ward_no": str(vehicle.get('ward_no', 'N/A')),
-                    "driver_name": str(vehicle.get('driverName', 'N/A')),
-                    "capacity": int(vehicle.get('capacity', 0)) if pd.notna(vehicle.get('capacity', 0)) else 0
+                    "vehicle_id": str(vehicle_info['vehicle_id']),
+                    "vehicle_type": str(vehicle_info['vehicle_type']),
+                    "status": str(vehicle_info['status']),
+                    "trips_assigned": vehicle_info['trips_assigned'],
+                    "houses_assigned": vehicle_info['houses_assigned'],
+                    "capacity_per_trip": vehicle_info['capacity_per_trip']
                 })
+                
+                for trip in assignment['trips']:
+                    route_summary.append({
+                        "trip_id": trip['trip_id'],
+                        "vehicle_id": vehicle_id,
+                        "house_count": trip['house_count'],
+                        "cluster_id": trip['cluster_id']
+                    })
             
             return JSONResponse({
                 "status": "success",
-                "message": f"Route optimization completed for ward {ward_no} with {len(vehicles_df)} live vehicles",
+                "message": f"Route optimization completed for ward {ward_no} with {optimization_result['active_vehicles']} active vehicles",
                 "maps": {
                     "route_map": "/generate-map/route_map",
                     "cluster_analysis": "/generate-map/cluster_analysis"
                 },
                 "dashboard": "/cluster-dashboard",
                 "ward_no": ward_no,
-                "vehicle_count": len(vehicles_df),
-                "vehicle_source": "Live API (Ward Filtered)",
+                "total_vehicles": len(vehicles_df),
+                "active_vehicles": optimization_result['active_vehicles'],
+                "total_houses": optimization_result['total_houses'],
+                "total_trips": len(route_summary),
+                "vehicle_source": vehicle_source,
                 "vehicles": vehicle_data,
+                "route_summary": route_summary,
                 "features": [
-                    "Live vehicle data integration",
-                    "Ward-based vehicle filtering",
-                    "Interactive cluster dashboard",
-                    "Real vehicle information in maps",
-                    "Color-coded routes and buildings"
+                    "Active vehicle filtering",
+                    "Capacity-based trip assignment",
+                    "Multiple trips per vehicle",
+                    "Optimized house-to-vehicle allocation",
+                    "Real-time route optimization"
                 ]
             })
             
@@ -651,7 +706,7 @@ async def generate_map(map_type: str):
     return HTMLResponse(content=html_content)
 
 def generate_map_from_files(ward_file, roads_file, buildings_file, vehicles_file=None):
-    """Generate map with layer controls."""
+    """Generate map with capacity-based route optimization."""
     # Load GeoJSON data using geopandas
     ward_gdf = gpd.read_file(ward_file)
     roads_gdf = gpd.read_file(roads_file)
@@ -696,12 +751,28 @@ def generate_map_from_files(ward_file, roads_file, buildings_file, vehicles_file
         import pandas as pd
         vehicles_df = pd.read_csv(vehicles_file)
         print(f"Loaded {len(vehicles_df)} vehicles for map generation")
-    
-    # Use vehicle count for clustering or default to 5
-    n_vehicles = len(vehicles_df) if vehicles_df is not None else 5
-    building_centroids = [(pt.x, pt.y) for pt in buildings_gdf.geometry.centroid]
-    kmeans = KMeans(n_clusters=min(n_vehicles, len(building_centroids)), random_state=42, n_init=10)
-    building_clusters = kmeans.fit_predict(building_centroids)
+        
+        # Use capacity-based optimization for active vehicles only
+        optimizer = CapacityRouteOptimizer()
+        optimization_result = optimizer.optimize_routes_with_capacity(
+            buildings_gdf, vehicles_df, roads_gdf
+        )
+        
+        # Create clusters based on optimization result
+        building_clusters = [0] * len(buildings_gdf)
+        cluster_id = 0
+        
+        for vehicle_id, assignment in optimization_result['route_assignments'].items():
+            for trip in assignment['trips']:
+                for house_idx in trip['houses']:
+                    if house_idx < len(building_clusters):
+                        building_clusters[house_idx] = cluster_id
+                cluster_id += 1
+    else:
+        # Fallback to simple clustering
+        building_centroids = [(pt.x, pt.y) for pt in buildings_gdf.geometry.centroid]
+        kmeans = KMeans(n_clusters=min(5, len(building_centroids)), random_state=42, n_init=10)
+        building_clusters = kmeans.fit_predict(building_centroids)
     
     # Create road network graph
     G = nx.Graph()
@@ -723,10 +794,13 @@ def generate_map_from_files(ward_file, roads_file, buildings_file, vehicles_file
                 dist = ((p1[0]-p2[0])**2 + (p1[1]-p2[1])**2)**0.5
                 G.add_edge(p1, p2, weight=dist)
     
-    # Colors and vehicle names from live data or defaults
+    # Colors and vehicle names from active vehicles or defaults
     colors = ['red', 'blue', 'green', 'purple', 'orange', 'brown', 'pink', 'gray', 'olive', 'cyan']
     if vehicles_df is not None:
-        vehicle_names = vehicles_df['vehicle_id'].tolist()[:len(set(building_clusters))]
+        active_vehicles = vehicles_df[
+            vehicles_df['status'].str.upper().isin(['ACTIVE', 'AVAILABLE', 'ONLINE'])
+        ]
+        vehicle_names = active_vehicles['vehicle_id'].tolist()[:len(set(building_clusters))]
     else:
         vehicle_names = ['Vehicle A', 'Vehicle B', 'Vehicle C', 'Vehicle D', 'Vehicle E']
     
@@ -738,12 +812,12 @@ def generate_map_from_files(ward_file, roads_file, buildings_file, vehicles_file
         if not cluster_buildings:
             continue
         
-        # Create separate layer for each cluster with vehicle info
+        # Create separate layer for each cluster with active vehicle info
         vehicle_name = vehicle_names[cluster_id] if cluster_id < len(vehicle_names) else f"Vehicle {cluster_id + 1}"
         vehicle_info = ""
-        if vehicles_df is not None and cluster_id < len(vehicles_df):
-            vehicle = vehicles_df.iloc[cluster_id]
-            vehicle_info = f" ({vehicle.get('vehicle_type', 'N/A')} - {vehicle.get('status', 'N/A')})"
+        if vehicles_df is not None and cluster_id < len(active_vehicles):
+            vehicle = active_vehicles.iloc[cluster_id]
+            vehicle_info = f" ({vehicle.get('vehicle_type', 'N/A')} - ACTIVE)"
         
         cluster_layer = folium.FeatureGroup(
             name=f"🚛 {vehicle_name}{vehicle_info} - {len(cluster_buildings)} buildings",
@@ -850,11 +924,11 @@ def generate_map_from_files(ward_file, roads_file, buildings_file, vehicles_file
                                 )
                             ).add_to(cluster_layer)
                     
-                    # Add start marker with vehicle info
-                    start_popup = f"{vehicle_name} Start"
-                    if vehicles_df is not None and cluster_id < len(vehicles_df):
-                        vehicle = vehicles_df.iloc[cluster_id]
-                        start_popup += f"\nID: {vehicle.get('vehicle_id', 'N/A')}\nWard: {vehicle.get('ward_no', 'N/A')}"
+                    # Add start marker with active vehicle info
+                    start_popup = f"{vehicle_name} Start (ACTIVE)"
+                    if vehicles_df is not None and cluster_id < len(active_vehicles):
+                        vehicle = active_vehicles.iloc[cluster_id]
+                        start_popup += f"\nID: {vehicle.get('vehicle_id', 'N/A')}\nCapacity: {vehicle.get('capacity', 'N/A')}"
                     
                     folium.Marker(
                         [start_point[1], start_point[0]],
@@ -897,9 +971,9 @@ def generate_map_from_files(ward_file, roads_file, buildings_file, vehicles_file
         if cluster_buildings:
             vehicle_name = vehicle_names[cluster_id] if cluster_id < len(vehicle_names) else f"Vehicle {cluster_id + 1}"
             vehicle_details = ""
-            if vehicles_df is not None and cluster_id < len(vehicles_df):
-                vehicle = vehicles_df.iloc[cluster_id]
-                vehicle_details = f" • {vehicle.get('vehicle_type', 'N/A')} • Ward {vehicle.get('ward_no', 'N/A')}"
+            if vehicles_df is not None and cluster_id < len(active_vehicles):
+                vehicle = active_vehicles.iloc[cluster_id]
+                vehicle_details = f" • {vehicle.get('vehicle_type', 'N/A')} • ACTIVE • Cap: {vehicle.get('capacity', 'N/A')}"
             
             cluster_stats.append(f'''
             <div style="margin:5px 0;padding:8px;border:1px solid #ddd;border-radius:4px;background:#f9f9f9;">

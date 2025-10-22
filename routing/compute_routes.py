@@ -12,31 +12,51 @@ class RouteComputer:
         self.road_graph = road_graph
         
     def compute_cluster_routes(self, clustered_buildings: gpd.GeoDataFrame, depot_location: tuple = None) -> dict:
-        """Compute chained routes where each vehicle's end connects to next vehicle's start."""
+        """Compute routes for multiple trips with no overlap between trips."""
         routes = {}
         cluster_ids = sorted(clustered_buildings['cluster'].unique())
-        previous_end = depot_location
         
-        for i, cluster_id in enumerate(cluster_ids):
-            cluster_buildings = clustered_buildings[clustered_buildings['cluster'] == cluster_id]
-            
-            if len(cluster_buildings) == 0:
-                continue
-            
-            # Use previous vehicle's end as this vehicle's start
-            if previous_end is None:
-                start_point = cluster_buildings.iloc[0]['road_node']
+        # Group clusters by trip number to ensure no overlap
+        trip_groups = {}
+        for cluster_id in cluster_ids:
+            if 'trip_' in str(cluster_id):
+                trip_num = int(str(cluster_id).split('_')[1])
+                if trip_num not in trip_groups:
+                    trip_groups[trip_num] = []
+                trip_groups[trip_num].append(cluster_id)
             else:
-                start_point = previous_end
+                # Fallback for non-trip clusters
+                if 'default' not in trip_groups:
+                    trip_groups['default'] = []
+                trip_groups['default'].append(cluster_id)
+        
+        # Process each trip separately to ensure no overlap
+        for trip_num, trip_cluster_ids in trip_groups.items():
+            logger.info(f"Processing Trip {trip_num} with {len(trip_cluster_ids)} vehicle routes")
+            previous_end = depot_location
             
-            route = self._solve_vrp_for_cluster(cluster_buildings, start_point)
-            routes[cluster_id] = route
-            
-            # Set end point for next vehicle
-            if route['nodes']:
-                previous_end = route['nodes'][-1]
-            
-        logger.info(f"Computed {len(routes)} chained vehicle routes")
+            for cluster_id in trip_cluster_ids:
+                cluster_buildings = clustered_buildings[clustered_buildings['cluster'] == cluster_id]
+                
+                if len(cluster_buildings) == 0:
+                    continue
+                
+                # Use previous vehicle's end as this vehicle's start within the same trip
+                if previous_end is None:
+                    start_point = cluster_buildings.iloc[0]['road_node']
+                else:
+                    start_point = previous_end
+                
+                route = self._solve_vrp_for_cluster(cluster_buildings, start_point)
+                route['trip_number'] = trip_num if trip_num != 'default' else 1
+                route['houses_count'] = len(cluster_buildings)
+                routes[cluster_id] = route
+                
+                # Set end point for next vehicle in the same trip
+                if route['nodes']:
+                    previous_end = route['nodes'][-1]
+        
+        logger.info(f"Computed {len(routes)} routes across {len(trip_groups)} trips")
         return routes
     
     def _solve_vrp_for_cluster(self, buildings: gpd.GeoDataFrame, depot: tuple) -> dict:

@@ -2,14 +2,19 @@
 import geopandas as gpd
 import pandas as pd
 import json
+import os
+import tempfile
 from loguru import logger
 from shapely.geometry import LineString
 from typing import Dict, List
 
 class RouteExporter:
-    def __init__(self):
+    def __init__(self, export_dir: str = None):
         self.routes_gdf = None
         self.summary_df = None
+        # Set export directory outside codebase
+        self.export_dir = export_dir or os.path.join(tempfile.gettempdir(), 'swm_exports')
+        os.makedirs(self.export_dir, exist_ok=True)
     
     def prepare_routes_geojson(self, routes: Dict, vehicles_df: pd.DataFrame, directions: Dict = None) -> gpd.GeoDataFrame:
         """Prepare routes data for GeoJSON export."""
@@ -46,17 +51,26 @@ class RouteExporter:
         logger.info(f"Prepared {len(route_features)} routes for export")
         return self.routes_gdf
     
-    def export_routes_geojson(self, output_path: str = "routes.geojson") -> str:
-        """Export routes to GeoJSON file."""
+    def export_routes_geojson(self, filename: str = "routes.geojson") -> str:
+        """Export routes to GeoJSON file outside codebase."""
         if self.routes_gdf is None:
             raise ValueError("No routes data prepared")
         
-        # Ensure CRS is set for geographic coordinates
-        if self.routes_gdf.crs is None:
-            self.routes_gdf.set_crs(epsg=4326, inplace=True)
+        # Export to temp directory, not codebase
+        output_path = os.path.join(self.export_dir, filename)
         
-        self.routes_gdf.to_file(output_path, driver='GeoJSON')
-        logger.info(f"Exported routes to {output_path}")
+        # Clean data - remove any response fields
+        clean_gdf = self.routes_gdf.copy()
+        exclude_fields = ['html_response', 'json_response', 'api_response', 'raw_output']
+        for field in exclude_fields:
+            if field in clean_gdf.columns:
+                clean_gdf = clean_gdf.drop(columns=[field])
+        
+        if clean_gdf.crs is None:
+            clean_gdf.set_crs(epsg=4326, inplace=True)
+        
+        clean_gdf.to_file(output_path, driver='GeoJSON')
+        logger.info(f"Exported to temp location: {output_path}")
         return output_path
     
     def prepare_summary_csv(self, routes: Dict, vehicles_df: pd.DataFrame, directions: Dict = None) -> pd.DataFrame:
@@ -120,13 +134,23 @@ class RouteExporter:
         logger.info(f"Prepared summary for {len(routes)} routes")
         return self.summary_df
     
-    def export_summary_csv(self, output_path: str = "summary.csv") -> str:
-        """Export summary to CSV file."""
+    def export_summary_csv(self, filename: str = "summary.csv") -> str:
+        """Export summary to CSV file outside codebase."""
         if self.summary_df is None:
             raise ValueError("No summary data prepared")
         
-        self.summary_df.to_csv(output_path, index=False)
-        logger.info(f"Exported summary to {output_path}")
+        # Export to temp directory, not codebase
+        output_path = os.path.join(self.export_dir, filename)
+        
+        # Clean data - remove any response fields
+        clean_df = self.summary_df.copy()
+        exclude_fields = ['html_response', 'json_response', 'api_response', 'raw_output']
+        for field in exclude_fields:
+            if field in clean_df.columns:
+                clean_df = clean_df.drop(columns=[field])
+        
+        clean_df.to_csv(output_path, index=False)
+        logger.info(f"Exported to temp location: {output_path}")
         return output_path
     
     def _format_directions(self, steps: List[Dict]) -> List[Dict]:

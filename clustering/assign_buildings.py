@@ -5,11 +5,13 @@ from sklearn.cluster import KMeans, DBSCAN
 from loguru import logger
 import numpy as np
 from services.vehicle_service import VehicleService
+from clustering.trip_assignment import TripAssignmentManager
 
 class BuildingClusterer:
     def __init__(self):
         self.clusters = None
         self.vehicle_service = VehicleService()
+        self.trip_manager = TripAssignmentManager()
         
     def load_vehicles(self, csv_path: str = None) -> pd.DataFrame:
         """Load vehicle data from live API or fallback to CSV."""
@@ -39,34 +41,34 @@ class BuildingClusterer:
             return self.vehicle_service._create_fallback_vehicles()
     
     def cluster_buildings(self, buildings_gdf: gpd.GeoDataFrame, num_vehicles: int, method='kmeans') -> gpd.GeoDataFrame:
-        """Cluster buildings based on number of vehicles."""
+        """Cluster buildings based on vehicle capacity and trip constraints."""
         if len(buildings_gdf) == 0:
             logger.warning("No buildings to cluster")
             return buildings_gdf
+        
+        # Assign trips based on capacity constraints
+        trip_assignments = self.trip_manager.assign_trips(buildings_gdf, num_vehicles)
+        
+        # Validate no overlap
+        if not self.trip_manager.validate_no_overlap(trip_assignments):
+            logger.error("Trip assignment validation failed")
+        
+        # Flatten trip assignments into a single GeoDataFrame
+        all_buildings = []
+        for trip_num, trip_data in trip_assignments['assignments'].items():
+            for vehicle_id, vehicle_data in trip_data.items():
+                all_buildings.append(vehicle_data['buildings'])
+        
+        if all_buildings:
+            result_gdf = pd.concat(all_buildings, ignore_index=True)
+            logger.info(f"Assigned {len(result_gdf)} buildings across {trip_assignments['num_trips']} trips")
             
-        # Extract coordinates
-        coords = np.array([[geom.x, geom.y] for geom in buildings_gdf.geometry])
-        
-        if method == 'kmeans':
-            clusterer = KMeans(n_clusters=num_vehicles, random_state=42, n_init=10)
-        elif method == 'dbscan':
-            # Auto-adjust eps based on data spread
-            eps = self._calculate_optimal_eps(coords)
-            clusterer = DBSCAN(eps=eps, min_samples=max(2, len(coords) // (num_vehicles * 3)))
+            # Store trip assignments for later use
+            self.trip_assignments = trip_assignments
+            return result_gdf
         else:
-            raise ValueError(f"Unknown clustering method: {method}")
-        
-        cluster_labels = clusterer.fit_predict(coords)
-        
-        # Handle DBSCAN noise points
-        if method == 'dbscan':
-            cluster_labels = self._reassign_noise_points(cluster_labels, coords, num_vehicles)
-        
-        buildings_gdf = buildings_gdf.copy()
-        buildings_gdf['cluster'] = cluster_labels
-        
-        logger.info(f"Clustered {len(buildings_gdf)} buildings into {len(set(cluster_labels))} clusters")
-        return buildings_gdf
+            logger.warning("No buildings assigned")
+            return buildings_gdf
     
     def _calculate_optimal_eps(self, coords: np.ndarray) -> float:
         """Calculate optimal eps for DBSCAN based on data spread."""
@@ -113,14 +115,19 @@ class BuildingClusterer:
         return labels
     
     def get_cluster_summary(self, buildings_gdf: gpd.GeoDataFrame) -> pd.DataFrame:
-        """Generate cluster summary statistics."""
-        summary = buildings_gdf.groupby('cluster').agg({
-            'geometry': 'count',
-            'snap_distance': ['mean', 'max']
-        }).round(4)
-        
-        summary.columns = ['building_count', 'avg_snap_distance', 'max_snap_distance']
-        summary = summary.reset_index()
-        
-        logger.info(f"Generated summary for {len(summary)} clusters")
-        return summary
+        """Generate cluster summary statistics including trip information."""
+        if hasattr(self, 'trip_assignments'):
+            # Use trip-based summary
+            return self.trip_manager.get_trip_summary(self.trip_assignments)
+        else:
+            # Fallback to original cluster summary
+            summary = buildings_gdf.groupby('cluster').agg({
+                'geometry': 'count',
+                'snap_distance': ['mean', 'max']
+            }).round(4)
+            
+            summary.columns = ['building_count', 'avg_snap_distance', 'max_snap_distance']
+            summary = summary.reset_index()
+            
+            logger.info(f"Generated summary for {len(summary)} clusters")
+            return summary

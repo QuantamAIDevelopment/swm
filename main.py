@@ -59,10 +59,16 @@ class GeospatialRouteOptimizer:
         num_vehicles = len(vehicles_df)
         clustered_buildings = self.clusterer.cluster_buildings(snapped_buildings, num_vehicles)
         
-        # 4️⃣ Compute optimal routes
-        logger.info("4️⃣ Computing optimal routes...")
+        # 4️⃣ Compute optimal routes with trip assignments
+        logger.info("4️⃣ Computing optimal routes with trip assignments...")
         self.route_computer = RouteComputer(road_graph)
         routes = self.route_computer.compute_cluster_routes(clustered_buildings)
+        
+        # Log trip statistics
+        if hasattr(self.clusterer, 'trip_assignments'):
+            trip_info = self.clusterer.trip_assignments
+            logger.info(f"📊 Trip Summary: {trip_info['num_trips']} trips, {trip_info['total_houses']} houses")
+            logger.info(f"🏠 Houses per trip capacity: {trip_info['houses_per_trip']}")
         
         # 5️⃣ Get OSRM directions with color coding
         logger.info("5️⃣ Getting turn-by-turn directions...")
@@ -111,6 +117,13 @@ class GeospatialRouteOptimizer:
         logger.info(f"📊 {num_vehicles} vehicles, {len(clustered_buildings)} buildings")
         logger.info(f"📏 Total distance: {results['total_distance']:.0f}m")
         logger.info(f"⏱️ Total duration: {results['total_duration']/60:.1f} min")
+        
+        # Add trip-specific results
+        if hasattr(self.clusterer, 'trip_assignments'):
+            trip_info = self.clusterer.trip_assignments
+            results['num_trips'] = trip_info['num_trips']
+            results['houses_per_trip_capacity'] = trip_info['houses_per_trip']
+            logger.info(f"🚛 Trips assigned: {trip_info['num_trips']} (max 2 per day)")
         
         return results
 
